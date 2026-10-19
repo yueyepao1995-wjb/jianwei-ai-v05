@@ -195,9 +195,12 @@ export default {
   }
   if(url.pathname!=='/api/gateway')return new Response('Not found',{status:404});
   if(request.method!=='GET'&&request.method!=='POST')return answer({error:'METHOD_NOT_ALLOWED'},405);
-  const configured=typeof env.SITE_PASSWORD==='string'&&env.SITE_PASSWORD.length>=16&&typeof env.SESSION_SECRET==='string'&&env.SESSION_SECRET.length>=32&&!!env.AI;
+  // Safe diagnostic: only status categories, never secrets or their lengths.
+  const statusOf=(value,min)=>typeof value!=='string'?'missing':value.length<min?'too_short':'ok';
+  const checks={sitePassword:statusOf(env.SITE_PASSWORD,16),sessionSecret:statusOf(env.SESSION_SECRET,32),aiBinding:env.AI?'ok':'missing'};
+  const configured=checks.sitePassword==='ok'&&checks.sessionSecret==='ok'&&checks.aiBinding==='ok';
   const authed=configured&&await validSession(request,env);
-  if(request.method==='GET')return answer({version:'0.5-Free',mode:'synthetic-only',configured,authenticated:authed,model:MODEL});
+  if(request.method==='GET')return answer({version:'0.5-Free-diagnostics',mode:'synthetic-only',configured,authenticated:authed,model:MODEL,...(!configured?{checks}:{})});
   if(request.headers.get('Origin')!==url.origin)return answer({error:'ORIGIN_NOT_ALLOWED'},403);
   if(!configured)return answer({error:'NOT_CONFIGURED',message:'请在 Cloudflare 后台设置 SITE_PASSWORD（至少16位）和 SESSION_SECRET（至少32位），并绑定 AI'},503);
   if((Number(request.headers.get('content-length')||0))>MAX_BYTES)return answer({error:'TOO_LARGE'},413);
