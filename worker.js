@@ -179,12 +179,29 @@ function modelResultToObject(reply){
 }
 async function aiExtract(body,env){
  const content=JSON.stringify({client_id:body.clientId,contact_date_shanghai:body.date,utterance:body.text,prior_synthetic_history:body.history});
- const response=await env.AI.run(MODEL,{
-  messages:[{role:'system',content:INSTRUCTIONS},{role:'user',content}],
-  response_format:{type:'json_schema',json_schema:OUTPUT_SCHEMA},
-  max_tokens:2500,temperature:0.1
- });
- return sanitizeModelOutput(modelResultToObject(response),body.text,body.date);
+ let response;
+ try {
+  response=await env.AI.run(MODEL,{
+   messages:[{role:'system',content:INSTRUCTIONS},{role:'user',content}],
+   response_format:{type:'json_schema',json_schema:OUTPUT_SCHEMA},
+   max_tokens:2500,temperature:0.1
+  });
+ } catch (e) {
+  const err=new Error('MODEL_CALL_FAILED');err.stage='model_call';err.reason=classifyModelError(e);throw err;
+ }
+ let decoded;
+ try { decoded=modelResultToObject(response); }
+ catch { const err=new Error('MODEL_RETURN_INVALID');err.stage='model_format';throw err; }
+ try { return sanitizeModelOutput(decoded,body.text,body.date); }
+ catch { const err=new Error('MODEL_OUTPUT_REJECTED');err.stage='model_validation';throw err; }
+}
+function classifyModelError(e){
+ const msg=String(e?.message||'');
+ if(/quota|rate.limit|neurons|exceeded|insufficient|daily.limit|too.many.requests/i.test(msg))return 'free_limit';
+ if(/JSON Mode|json.schema|grammar|structured.output|couldn.t be met|constraint/i.test(msg))return 'json_constraint';
+ if(/model.*(not.found|unavailable|unsupported)|unknown model/i.test(msg))return 'model_unavailable';
+ if(/timeout|timed.out|deadline|gateway/i.test(msg))return 'timeout';
+ return 'other';
 }
 export default {
  async fetch(request,env){
@@ -200,7 +217,18 @@ export default {
   const checks={sitePassword:statusOf(env.SITE_PASSWORD,16),sessionSecret:statusOf(env.SESSION_SECRET,32),aiBinding:env.AI?'ok':'missing'};
   const configured=checks.sitePassword==='ok'&&checks.sessionSecret==='ok'&&checks.aiBinding==='ok';
   const authed=configured&&await validSession(request,env);
-  if(request.method==='GET')return answer({version:'0.5-Free-diagnostics',mode:'synthetic-only',configured,authenticated:authed,model:MODEL,...(!configured?{checks}:{})});
+  // Protected and bounded live inference probe. No customer text and no secrets in the response.
+  if(request.method==='GET'&&url.searchParams.get('probe')==='1'){
+   if(!configured)return answer({ok:false,stage:'configuration'},503);
+   if(!authed)return answer({ok:false,stage:'authentication',message:'请先在见微页面登录 AI 接口，然后在同一个浏览器打开本地址'},401);
+   try {
+    const probe=await env.AI.run(MODEL,{messages:[{role:'user',content:'Reply with the word OK only.'}],max_tokens:24,temperature:0});
+    const response=probe?.response??probe;
+    const okay=(typeof response==='string'&&response.trim().length>0)||(response&&typeof response==='object');
+    return answer({ok:!!okay,stage:okay?'model_basic_ok':'model_empty',model:MODEL});
+   } catch(e){return answer({ok:false,stage:'model_basic_failed',reason:classifyModelError(e),model:MODEL},502);}
+  }
+  if(request.method==='GET')return answer({version:'0.5-Free-model-diagnostics',mode:'synthetic-only',configured,authenticated:authed,model:MODEL,...(!configured?{checks}:{})});
   if(request.headers.get('Origin')!==url.origin)return answer({error:'ORIGIN_NOT_ALLOWED'},403);
   if(!configured)return answer({error:'NOT_CONFIGURED',message:'请在 Cloudflare 后台设置 SITE_PASSWORD（至少16位）和 SESSION_SECRET（至少32位），并绑定 AI'},503);
   if((Number(request.headers.get('content-length')||0))>MAX_BYTES)return answer({error:'TOO_LARGE'},413);
@@ -226,10 +254,12 @@ export default {
    const result=await aiExtract(data,env);
    return answer({contract:'JW_EXTRACTION_0_5_FREE',model:MODEL,reviewRequired:true,result});
   }catch(error){
-   // Model exceptions are intentionally not reflected back in detail.
-   const msg=String(error?.message||'');
-   const budget=/(quota|rate.limit|neurons|exceeded|limit)/i.test(msg);
-   return answer({error:budget?'FREE_LIMIT':'MODEL_FAILED',message:budget?'免费模型额度可能已用完，请明天再试，或使用离线规则':'AI 提取未完成，请稍后重试或使用离线规则；本次内容没有自动保存'},budget?429:502);
+   // Public error categories are deliberately coarse; do not reveal payload or upstream raw text.
+   const stage=error?.stage||'unknown';
+   const reason=error?.reason||'other';
+   const budget=reason==='free_limit';
+   const text=budget?'免费 AI 额度或频率受限，可稍后再试':'AI 识别尚未完成，数据未自动保存';
+   return answer({error:budget?'FREE_LIMIT':'MODEL_FAILED',stage,reason:stage==='model_call'?reason:undefined,message:text},budget?429:502);
   }
  }
 };
